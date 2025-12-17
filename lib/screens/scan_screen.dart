@@ -12,6 +12,7 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import '../routes.dart';
 import '../services/openfoodfacts_service.dart';
 import '../models/product.dart';
+import '../theme.dart';
 
 class ScanScreen extends StatefulWidget {
   const ScanScreen({Key? key}) : super(key: key);
@@ -20,7 +21,8 @@ class ScanScreen extends StatefulWidget {
   State<ScanScreen> createState() => _ScanScreenState();
 }
 
-class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
+class _ScanScreenState extends State<ScanScreen>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   CameraController? controller;
   List<CameraDescription> cameras = [];
   final barcodeScanner = BarcodeScanner();
@@ -32,15 +34,40 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
 
   bool _processing = false;
   Timer? _resumeTimer;
-
-  // fallback: if no barcode found after this many seconds, try capturing a photo
   static const int kFallbackSeconds = 6;
   Timer? _fallbackTimer;
+
+  // Animation controllers
+  late AnimationController _scanLineController;
+  late AnimationController _pulseController;
+  late Animation<double> _scanLineAnimation;
+  late Animation<double> _pulseAnimation;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    // Scan line animation
+    _scanLineController = AnimationController(
+      duration: const Duration(milliseconds: 2000),
+      vsync: this,
+    )..repeat();
+
+    _scanLineAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _scanLineController, curve: Curves.easeInOut),
+    );
+
+    // Pulse animation for corners
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    )..repeat(reverse: true);
+
+    _pulseAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+
     _initCameraPermission();
   }
 
@@ -64,24 +91,20 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
 
       controller = CameraController(
         cameras.first,
-        ResolutionPreset.high, // use high for better detection
+        ResolutionPreset.high,
         enableAudio: false,
       );
 
       await controller!.initialize();
-
-      // start the frame stream
       await controller!.startImageStream(_processCameraImage);
-
-      // start fallback timer
       _startFallbackTimer();
 
       setState(() {});
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Camera error: $e")));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Camera error: $e")),
+        );
       }
     }
   }
@@ -104,7 +127,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       return;
     }
 
-    // stop stream
     try {
       await controller!.stopImageStream();
     } catch (_) {}
@@ -113,11 +135,9 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
 
     try {
       xfile = await controller!.takePicture();
-
       final inputImage = InputImage.fromFilePath(xfile.path);
 
       final barcodes = await barcodeScanner.processImage(inputImage);
-
       if (barcodes.isNotEmpty) {
         final code = barcodes.first.rawValue;
         if (code != null && code.isNotEmpty) {
@@ -125,15 +145,11 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
           return;
         }
       }
-      // 2. Try Text Recognition
+
       final recognizedText = await textRecognizer.processImage(inputImage);
       String? bestText;
 
-      // Simple heuristic: take the largest block of text or just the first non-empty one
-      // You can refine this to look for specific patterns or largest bounding box
       if (recognizedText.blocks.isNotEmpty) {
-        // filter out small text or numbers if needed
-        // For now, let's try the longest block found, as brand names are often prominent
         String? candidate;
         int maxLength = 0;
 
@@ -151,7 +167,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       }
 
       if (bestText != null) {
-        // Search product by detected text
         final product = await ofService.searchByName(bestText);
         if (product != null) {
           Navigator.pushReplacementNamed(
@@ -160,20 +175,12 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
             arguments: product,
           );
           return;
-        } else {
-           debugPrint('No product found for text "$bestText", trying labels...');
         }
       }
 
-      // 3. Fallback to Image Labeling
       final labels = await imageLabeler.processImage(inputImage);
       if (labels.isNotEmpty) {
-        for (final label in labels)
-          debugPrint("Label detected: ${label.label}  | confidence: ${label.confidence}");
-
         final top = labels.first.label;
-
-        // search product by name
         final product = await ofService.searchByName(top);
 
         if (product != null) {
@@ -183,61 +190,44 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
             arguments: product,
           );
           return;
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('No product found for "$top" (or text "$bestText")')),
-          );
         }
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No labels or text detected in the photo')),
-        );
       }
     } catch (e) {
       debugPrint('Fallback capture error: $e');
     } finally {
-      // restart stream
       try {
         if (controller != null && controller!.value.isInitialized) {
           await controller!.startImageStream(_processCameraImage);
         }
       } catch (e) {
-        debugPrint('Error restarting stream after fallback: $e');
+        debugPrint('Error restarting stream: $e');
       }
-
       _startFallbackTimer();
     }
   }
-
 
   void _processCameraImage(CameraImage image) async {
     if (_processing) return;
     _processing = true;
 
     try {
-      // Combine plane bytes to a single Uint8List (as ML Kit expects)
       final WriteBuffer buffer = WriteBuffer();
       for (final plane in image.planes) {
         buffer.putUint8List(plane.bytes);
       }
       final bytes = buffer.done().buffer.asUint8List();
 
-      // Build metadata using new ML Kit API (InputImageMetadata)
       final metadata = InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation:
-            InputImageRotationValue.fromRawValue(
-              cameras.first.sensorOrientation,
-            ) ??
+        rotation: InputImageRotationValue.fromRawValue(
+                cameras.first.sensorOrientation) ??
             InputImageRotation.rotation0deg,
-        format:
-            InputImageFormatValue.fromRawValue(image.format.raw) ??
+        format: InputImageFormatValue.fromRawValue(image.format.raw) ??
             InputImageFormat.nv21,
         bytesPerRow: image.planes.first.bytesPerRow,
       );
 
       final inputImage = InputImage.fromBytes(bytes: bytes, metadata: metadata);
-
       final barcodes = await barcodeScanner.processImage(inputImage);
 
       if (barcodes.isNotEmpty) {
@@ -248,12 +238,10 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
         }
       }
 
-      // no barcode: reset fallback timer to keep trying until fallback fires
       _resetFallbackTimer();
     } catch (e) {
-      // continue — fallback will be attempted eventually
+      // continue
     } finally {
-      // throttle a bit so we don't hog CPU
       Future.delayed(const Duration(milliseconds: 150), () {
         _processing = false;
       });
@@ -261,7 +249,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _onBarcodeDetected(String code) async {
-
     try {
       await controller?.stopImageStream();
     } catch (_) {}
@@ -271,12 +258,31 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (_) => const Center(child: CircularProgressIndicator()),
+      builder: (_) => Center(
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation(AppColors.primaryStart),
+              ),
+              const SizedBox(height: 16),
+              Text('Scanning product...',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+            ],
+          ),
+        ),
+      ),
     );
 
     try {
       final product = await ofService.fetchByBarcode(code);
-      Navigator.of(context).pop(); // close loading
+      Navigator.of(context).pop();
 
       if (product != null) {
         Navigator.pushReplacementNamed(
@@ -286,15 +292,15 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
         );
         return;
       } else {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Product not found: $code')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Product not found: $code')),
+        );
       }
     } catch (e) {
       Navigator.of(context).pop();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Lookup error: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Lookup error: $e')),
+      );
     } finally {
       _resumeScanningWithDelay();
     }
@@ -315,62 +321,224 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     });
   }
 
-  // Manual control bar (flash + capture)
-  Widget _controls() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12),
+  Widget _buildScanOverlay() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = constraints.maxWidth * 0.7;
+        return Center(
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Stack(
+              children: [
+                // Animated corners
+                ..._buildAnimatedCorners(size),
+                // Scanning line
+                AnimatedBuilder(
+                  animation: _scanLineAnimation,
+                  builder: (context, child) {
+                    return Positioned(
+                      top: size * _scanLineAnimation.value,
+                      left: 0,
+                      right: 0,
+                      child: Container(
+                        height: 2,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              Colors.transparent,
+                              AppColors.secondaryStart,
+                              Colors.transparent,
+                            ],
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: AppColors.secondaryStart,
+                              blurRadius: 10,
+                              spreadRadius: 2,
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  List<Widget> _buildAnimatedCorners(double size) {
+    return [
+      // Top-left
+      _buildCorner(0, 0, [0, 0, 1, 1]),
+      // Top-right
+      _buildCorner(0, size - 30, [1, 0, 0, 1]),
+      // Bottom-left
+      _buildCorner(size - 30, 0, [0, 1, 1, 0]),
+      // Bottom-right
+      _buildCorner(size - 30, size - 30, [1, 1, 0, 0]),
+    ];
+  }
+
+  Widget _buildCorner(double top, double left, List<int> borders) {
+    return AnimatedBuilder(
+      animation: _pulseAnimation,
+      builder: (context, child) {
+        return Positioned(
+          top: top,
+          left: left,
+          child: Opacity(
+            opacity: _pulseAnimation.value,
+            child: Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                border: Border(
+                  top: borders[0] == 1
+                      ? BorderSide(color: Colors.white, width: 4)
+                      : BorderSide.none,
+                  right: borders[1] == 1
+                      ? BorderSide(color: Colors.white, width: 4)
+                      : BorderSide.none,
+                  bottom: borders[2] == 1
+                      ? BorderSide(color: Colors.white, width: 4)
+                      : BorderSide.none,
+                  left: borders[3] == 1
+                      ? BorderSide(color: Colors.white, width: 4)
+                      : BorderSide.none,
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildControls() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Colors.transparent,
+            Colors.black.withOpacity(0.7),
+          ],
+        ),
+      ),
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          IconButton(
-            onPressed: () async {
+          _buildControlButton(
+            icon: Icons.flash_on,
+            label: 'Flash',
+            onTap: () async {
               if (controller == null) return;
               try {
                 final mode = controller!.value.flashMode;
-                final newMode = mode == FlashMode.off
-                    ? FlashMode.torch
-                    : FlashMode.off;
+                final newMode =
+                    mode == FlashMode.off ? FlashMode.torch : FlashMode.off;
                 await controller!.setFlashMode(newMode);
                 setState(() {});
-              } catch (e) {
-              }
+              } catch (e) {}
             },
-            icon: Icon(Icons.flash_on),
           ),
-          const Spacer(),
-          ElevatedButton.icon(
-            onPressed: () async {
-              // manual capture fallback (same as automatic fallback)
-              await _tryImageFileScanFallback();
+          _buildControlButton(
+            icon: Icons.camera_alt,
+            label: 'Capture',
+            onTap: _tryImageFileScanFallback,
+            isPrimary: true,
+          ),
+          _buildControlButton(
+            icon: Icons.help_outline,
+            label: 'Help',
+            onTap: () {
+              // Show help dialog
             },
-            icon: const Icon(Icons.camera_alt),
-            label: const Text('Capture'),
           ),
         ],
       ),
     );
   }
 
-  Widget _cameraPreview() {
-    if (controller == null || !controller!.value.isInitialized) {
-      return AspectRatio(
-        aspectRatio: 3 / 4,
+  Widget _buildControlButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+    bool isPrimary = false,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
         child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 16),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
           decoration: BoxDecoration(
-            color: Colors.black12,
-            borderRadius: BorderRadius.circular(14),
+            gradient: isPrimary ? primaryGradient : null,
+            color: isPrimary ? null : Colors.white.withOpacity(0.2),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: Colors.white.withOpacity(0.3),
+              width: 1,
+            ),
           ),
-          child: const Center(child: CircularProgressIndicator()),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: Colors.white, size: 24),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCameraPreview() {
+    if (controller == null || !controller!.value.isInitialized) {
+      return Container(
+        color: Colors.black,
+        child: const Center(
+          child: CircularProgressIndicator(color: Colors.white),
         ),
       );
     }
 
-    return AspectRatio(
-      aspectRatio: controller!.value.aspectRatio,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(14),
-        child: CameraPreview(controller!),
-      ),
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        CameraPreview(controller!),
+        Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                Colors.black.withOpacity(0.3),
+                Colors.transparent,
+                Colors.transparent,
+                Colors.black.withOpacity(0.5),
+              ],
+            ),
+          ),
+        ),
+        _buildScanOverlay(),
+      ],
     );
   }
 
@@ -382,6 +550,8 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     textRecognizer.close();
     _resumeTimer?.cancel();
     _fallbackTimer?.cancel();
+    _scanLineController.dispose();
+    _pulseController.dispose();
     super.dispose();
   }
 
@@ -399,16 +569,31 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Scan Product")),
+      backgroundColor: Colors.black,
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: const Text(
+          "Scan Product",
+          style: TextStyle(color: Colors.white),
+        ),
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
       body: Column(
         children: [
-          const SizedBox(height: 12),
-          _cameraPreview(),
-          _controls(),
-          const Padding(
-            padding: EdgeInsets.all(16.0),
-            child: Text(
-              "Point the camera at a barcode. If the stream fails, the app will take a photo automatically.",
+          Expanded(child: _buildCameraPreview()),
+          _buildControls(),
+          Container(
+            padding: const EdgeInsets.all(20),
+            color: Colors.black,
+            child: const Text(
+              "Align the barcode within the frame.\nAuto-capture will trigger if no barcode is detected.",
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 14,
+              ),
             ),
           ),
         ],
